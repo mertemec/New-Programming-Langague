@@ -1,220 +1,429 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+#!/usr/bin/env python3
+"""
+NewLang — minimal interpreter
 
-# C extensions
-*.so
+Usage:
+  python3 main.py program.tl
+"""
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+import sys
+import re
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# ---------------------
+# Lexer
+# ---------------------
+TOKEN_SPEC = [
+    ('NUMBER',   r'\d+(\.\d+)?'),
+    ('ID',       r'[A-Za-z_][A-Za-z0-9_]*'),
+    ('OP',       r'==|!=|<=|>=|[+\-*/<>!]'),
+    ('ASSIGN',   r'='),
+    ('LPAREN',   r'\('),
+    ('RPAREN',   r'\)'),
+    ('LBRACE',   r'\{'),
+    ('RBRACE',   r'\}'),
+    ('SEMICOLON',r';'),
+    ('COMMA',    r','),
+    ('SKIP',     r'[ \t]+'),
+    ('NEWLINE',  r'\n'),
+    ('COMMENT',  r'#.*'),
+]
+TOKEN_RE = re.compile('|'.join('(?P<%s>%s)' % pair for pair in TOKEN_SPEC))
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+KEYWORDS = {'let','if','else','while','print','true','false','null'}
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-*.lcov
-.hypothesis/
-.pytest_cache/
-cover/
+class Token:
+    def __init__(self, type_, value, pos):
+        self.type = type_
+        self.value = value
+        self.pos = pos
+    def __repr__(self):
+        return f'Token({self.type},{self.value})'
 
-# Translations
-*.mo
-*.pot
+def lex(code):
+    pos = 0
+    line = 1
+    tokens = []
+    for m in TOKEN_RE.finditer(code):
+        kind = m.lastgroup
+        value = m.group()
+        if kind == 'NUMBER':
+            if '.' in value:
+                value = float(value)
+            else:
+                value = int(value)
+            tokens.append(Token('NUMBER', value, pos))
+        elif kind == 'ID':
+            if value in KEYWORDS:
+                tokens.append(Token(value.upper(), value, pos))
+            else:
+                tokens.append(Token('ID', value, pos))
+        elif kind == 'SKIP' or kind == 'COMMENT':
+            pass
+        elif kind == 'NEWLINE':
+            tokens.append(Token('NEWLINE', '\\n', pos))
+            line += 1
+        else:
+            tokens.append(Token(kind, value, pos))
+        pos = m.end()
+    tokens.append(Token('EOF', None, pos))
+    return tokens
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# ---------------------
+# Parser (recursive descent)
+# ---------------------
+class ParseError(Exception): pass
 
-# Flask stuff:
-instance/
-.webassets-cache
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = [t for t in tokens if t.type != 'NEWLINE']
+        self.pos = 0
 
-# Scrapy stuff:
-.scrapy
+    def peek(self):
+        return self.tokens[self.pos]
 
-# Sphinx documentation
-docs/_build/
+    def consume(self, expected_type=None):
+        t = self.peek()
+        if expected_type and t.type != expected_type:
+            raise ParseError(f'Expected {expected_type} but got {t.type}')
+        self.pos += 1
+        return t
 
-# PyBuilder
-.pybuilder/
-target/
+    def match(self, *types):
+        if self.peek().type in types:
+            return self.consume()
+        return None
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    def parse(self):
+        stmts = []
+        while self.peek().type != 'EOF':
+            stmts.append(self.statement())
+        return Program(stmts)
 
-# IPython
-profile_default/
-ipython_config.py
+    # statements
+    def statement(self):
+        t = self.peek()
+        if t.type == 'LET':
+            return self.let_stmt()
+        elif t.type == 'LBRACE':
+            return self.block_stmt()
+        elif t.type == 'IF':
+            return self.if_stmt()
+        elif t.type == 'WHILE':
+            return self.while_stmt()
+        elif t.type == 'PRINT':
+            return self.print_stmt()
+        elif t.type == 'ID':
+            # assignment or expression statement
+            # lookahead for '='
+            if self.tokens[self.pos+1].type == 'ASSIGN':
+                return self.assign_stmt()
+            else:
+                expr = self.expr()
+                self.consume('SEMICOLON')
+                return ExprStmt(expr)
+        else:
+            expr = self.expr()
+            self.consume('SEMICOLON')
+            return ExprStmt(expr)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    def let_stmt(self):
+        self.consume('LET')
+        name = self.consume('ID').value
+        self.consume('ASSIGN')
+        value = self.expr()
+        self.consume('SEMICOLON')
+        return LetStmt(name, value)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+    def assign_stmt(self):
+        name = self.consume('ID').value
+        self.consume('ASSIGN')
+        value = self.expr()
+        self.consume('SEMICOLON')
+        return AssignStmt(name, value)
 
-# uv
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+    def print_stmt(self):
+        self.consume('PRINT')
+        self.consume('LPAREN')
+        expr = self.expr()
+        self.consume('RPAREN')
+        self.consume('SEMICOLON')
+        return PrintStmt(expr)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+    def block_stmt(self):
+        self.consume('LBRACE')
+        stmts = []
+        while self.peek().type != 'RBRACE':
+            if self.peek().type == 'EOF':
+                raise ParseError('Unexpected EOF in block')
+            stmts.append(self.statement())
+        self.consume('RBRACE')
+        return BlockStmt(stmts)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+    def if_stmt(self):
+        self.consume('IF')
+        self.consume('LPAREN')
+        cond = self.expr()
+        self.consume('RPAREN')
+        then_block = self.block_stmt()
+        else_block = None
+        if self.peek().type == 'ELSE':
+            self.consume('ELSE')
+            else_block = self.block_stmt()
+        return IfStmt(cond, then_block, else_block)
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi/*
-!.pixi/config.toml
+    def while_stmt(self):
+        self.consume('WHILE')
+        self.consume('LPAREN')
+        cond = self.expr()
+        self.consume('RPAREN')
+        body = self.block_stmt()
+        return WhileStmt(cond, body)
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    # expressions with precedence
+    def expr(self):
+        return self.equality()
 
-# Celery stuff
-celerybeat-schedule*
-celerybeat.pid
+    def equality(self):
+        node = self.comparison()
+        while self.peek().type == 'OP' and self.peek().value in ('==','!='):
+            op = self.consume().value
+            right = self.comparison()
+            node = BinaryOp(node, op, right)
+        return node
 
-# Redis
-*.rdb
-*.aof
-*.pid
+    def comparison(self):
+        node = self.term()
+        while self.peek().type == 'OP' and self.peek().value in ('<','>','<=','>='):
+            op = self.consume().value
+            right = self.term()
+            node = BinaryOp(node, op, right)
+        return node
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+    def term(self):
+        node = self.factor()
+        while self.peek().type == 'OP' and self.peek().value in ('+','-'):
+            op = self.consume().value
+            right = self.factor()
+            node = BinaryOp(node, op, right)
+        return node
 
-# ActiveMQ
-activemq-data/
+    def factor(self):
+        node = self.unary()
+        while self.peek().type == 'OP' and self.peek().value in ('*','/'):
+            op = self.consume().value
+            right = self.unary()
+            node = BinaryOp(node, op, right)
+        return node
 
-# SageMath parsed files
-*.sage.py
+    def unary(self):
+        if self.peek().type == 'OP' and self.peek().value in ('-','!'):
+            op = self.consume().value
+            operand = self.unary()
+            return UnaryOp(op, operand)
+        return self.primary()
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+    def primary(self):
+        t = self.peek()
+        if t.type == 'NUMBER':
+            self.consume()
+            return NumberLiteral(t.value)
+        if t.type == 'TRUE':
+            self.consume()
+            return BoolLiteral(True)
+        if t.type == 'FALSE':
+            self.consume()
+            return BoolLiteral(False)
+        if t.type == 'ID':
+            name = self.consume().value
+            return VarRef(name)
+        if t.type == 'LPAREN':
+            self.consume()
+            e = self.expr()
+            self.consume('RPAREN')
+            return e
+        raise ParseError(f'Unexpected token {t.type} ({t.value})')
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# ---------------------
+# AST Nodes
+# ---------------------
+class Node: pass
 
-# Rope project settings
-.ropeproject
+class Program(Node):
+    def __init__(self, stmts): self.stmts = stmts
 
-# mkdocs/Zensical documentation
-/site
+class LetStmt(Node):
+    def __init__(self, name, value): self.name = name; self.value = value
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+class AssignStmt(Node):
+    def __init__(self, name, value): self.name = name; self.value = value
 
-# Pyre type checker
-.pyre/
+class PrintStmt(Node):
+    def __init__(self, expr): self.expr = expr
 
-# pytype static type analyzer
-.pytype/
+class IfStmt(Node):
+    def __init__(self, cond, then_block, else_block): self.cond = cond; self.then_block = then_block; self.else_block = else_block
 
-# Cython debug symbols
-cython_debug/
+class WhileStmt(Node):
+    def __init__(self, cond, body): self.cond = cond; self.body = body
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+class BlockStmt(Node):
+    def __init__(self, stmts): self.stmts = stmts
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+class ExprStmt(Node):
+    def __init__(self, expr): self.expr = expr
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
+class NumberLiteral(Node):
+    def __init__(self, value): self.value = value
 
-# Ruff stuff:
-.ruff_cache/
+class BoolLiteral(Node):
+    def __init__(self, value): self.value = value
 
-# PyPI configuration file
-.pypirc
+class VarRef(Node):
+    def __init__(self, name): self.name = name
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+class BinaryOp(Node):
+    def __init__(self, left, op, right): self.left = left; self.op = op; self.right = right
 
-# Streamlit
-.streamlit/secrets.toml
+class UnaryOp(Node):
+    def __init__(self, op, operand): self.op = op; self.operand = operand
+
+# ---------------------
+# Interpreter
+# ---------------------
+class RuntimeError_(Exception): pass
+
+class Environment:
+    def __init__(self, parent=None):
+        self.vars = {}
+        self.parent = parent
+    def get(self, name):
+        if name in self.vars:
+            return self.vars[name]
+        if self.parent:
+            return self.parent.get(name)
+        raise RuntimeError_(f'Undefined variable: {name}')
+    def set(self, name, value):
+        if name in self.vars:
+            self.vars[name] = value
+        elif self.parent:
+            self.parent.set(name, value)
+        else:
+            raise RuntimeError_(f'Undefined variable: {name}')
+    def define(self, name, value):
+        self.vars[name] = value
+
+class Interpreter:
+    def __init__(self):
+        self.globals = Environment()
+    def run(self, program):
+        try:
+            self.exec_block(program.stmts, self.globals)
+        except RuntimeError_ as e:
+            print("Runtime error:", e)
+
+    def exec_block(self, stmts, env):
+        prev = getattr(self, 'env', None)
+        self.env = env
+        for s in stmts:
+            self.exec_stmt(s)
+        self.env = prev
+
+    def exec_stmt(self, stmt):
+        if isinstance(stmt, LetStmt):
+            val = self.eval_expr(stmt.value)
+            self.env.define(stmt.name, val)
+        elif isinstance(stmt, AssignStmt):
+            val = self.eval_expr(stmt.value)
+            self.env.set(stmt.name, val)
+        elif isinstance(stmt, PrintStmt):
+            val = self.eval_expr(stmt.expr)
+            print(self.stringify(val))
+        elif isinstance(stmt, IfStmt):
+            cond = self.eval_expr(stmt.cond)
+            if self.is_truthy(cond):
+                self.exec_stmt(stmt.then_block)
+            elif stmt.else_block:
+                self.exec_stmt(stmt.else_block)
+        elif isinstance(stmt, WhileStmt):
+            while self.is_truthy(self.eval_expr(stmt.cond)):
+                self.exec_stmt(stmt.body)
+        elif isinstance(stmt, BlockStmt):
+            child = Environment(parent=self.env)
+            self.exec_block(stmt.stmts, child)
+        elif isinstance(stmt, ExprStmt):
+            self.eval_expr(stmt.expr)
+        else:
+            raise RuntimeError_(f'Unknown stmt {stmt}')
+
+    def eval_expr(self, expr):
+        if isinstance(expr, NumberLiteral):
+            return expr.value
+        if isinstance(expr, BoolLiteral):
+            return expr.value
+        if isinstance(expr, VarRef):
+            return self.env.get(expr.name)
+        if isinstance(expr, UnaryOp):
+            val = self.eval_expr(expr.operand)
+            if expr.op == '-':
+                return -val
+            if expr.op == '!':
+                return not self.is_truthy(val)
+            raise RuntimeError_(f'Unknown unary op {expr.op}')
+        if isinstance(expr, BinaryOp):
+            l = self.eval_expr(expr.left)
+            r = self.eval_expr(expr.right)
+            op = expr.op
+            if op == '+': return l + r
+            if op == '-': return l - r
+            if op == '*': return l * r
+            if op == '/': return l / r
+            if op == '<': return l < r
+            if op == '>': return l > r
+            if op == '<=': return l <= r
+            if op == '>=': return l >= r
+            if op == '==': return l == r
+            if op == '!=': return l != r
+            raise RuntimeError_(f'Unknown binary op {op}')
+        raise RuntimeError_(f'Unknown expr {expr}')
+
+    def is_truthy(self, value):
+        if value is None: return False
+        if isinstance(value, bool): return value
+        if isinstance(value, (int,float)): return value != 0
+        return True
+
+    def stringify(self, v):
+        if v is None: return 'null'
+        return str(v)
+
+# ---------------------
+# Main / CLI
+# ---------------------
+def repl():
+    interp = Interpreter()
+    print("MertLang REPL — type 'exit' to quit")
+    while True:
+        try:
+            line = input('> ')
+        except EOFError:
+            break
+        if line.strip() == 'exit': break
+        try:
+            tokens = lex(line + '\n')  # ensure EOF
+            program = Parser(tokens).parse()
+            interp.run(program)
+        except Exception as e:
+            print("Error:", e)
+
+def run_file(path):
+    with open(path, 'r') as f:
+        code = f.read()
+    tokens = lex(code)
+    ast = Parser(tokens).parse()
+    Interpreter().run(ast)
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        repl()
+    else:
+        run_file(sys.argv[1])
